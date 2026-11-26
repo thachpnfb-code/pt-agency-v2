@@ -1,6 +1,6 @@
-import os, sqlite3, secrets, hmac, uuid
+import os, re, sqlite3, secrets, hmac, uuid
 from functools import wraps
-from flask import Flask, request, session, redirect, url_for, render_template_string, abort, send_from_directory
+from flask import Flask, request, session, redirect, url_for, render_template_string, abort, send_from_directory, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 app=Flask(__name__)
 app.secret_key=os.environ.get('SECRET_KEY') or secrets.token_hex(32)
@@ -10,7 +10,7 @@ STATES=['Chờ thanh toán','Chờ xác nhận','Đã thanh toán','Đang xử l
 def db():
     c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
 with db() as c:
-    c.executescript('''CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE, password TEXT, role TEXT); CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY, uid INTEGER, page TEXT, qty INTEGER, price INTEGER, cost INTEGER, commission INTEGER, status TEXT, created TEXT DEFAULT CURRENT_TIMESTAMP, link TEXT DEFAULT '', finished TEXT); CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY,price INTEGER,cost INTEGER,commission INTEGER); INSERT OR IGNORE INTO settings VALUES(1,790000,0,0); CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY, actor TEXT, action TEXT, created TEXT DEFAULT CURRENT_TIMESTAMP);''')
+    c.executescript('''CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE, password TEXT, role TEXT); CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY, uid INTEGER, page TEXT, qty INTEGER, price INTEGER, cost INTEGER, commission INTEGER, status TEXT, created TEXT DEFAULT CURRENT_TIMESTAMP, link TEXT DEFAULT '', finished TEXT); CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY,price INTEGER,cost INTEGER,commission INTEGER); INSERT OR IGNORE INTO settings VALUES(1,790000,0,0); CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY, actor TEXT, action TEXT, created TEXT DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS sepay_txns(sepay_id TEXT PRIMARY KEY, oid TEXT, amount INTEGER, content TEXT, created TEXT DEFAULT CURRENT_TIMESTAMP);''')
     pw=os.environ.get('ADMIN_PASSWORD'); email=os.environ.get('ADMIN_EMAIL','admin@ptagency.local')
     if pw and len(pw)>=12: c.execute('INSERT OR IGNORE INTO users(name,email,password,role) VALUES(?,?,?,?)',('PT Agency Admin',email.lower(),generate_password_hash(pw),'admin'))
 def user():
@@ -25,9 +25,12 @@ def guard(admin=False):
             return f(*a,**k)
         return wrapper
     return deco
+SEPAY_WEBHOOK_PATHS={'/webhook/sepay','/api/payments/webhook/sepay'}
+SEPAY_ACCOUNT='102816811239'
 @app.before_request
 def csrf():
     if 'csrf' not in session: session['csrf']=secrets.token_hex(24)
+    if request.path in SEPAY_WEBHOOK_PATHS: return
     if request.method=='POST' and not hmac.compare_digest(session['csrf'],request.form.get('csrf','')): abort(400)
 @app.context_processor
 def common(): return dict(u=user(),csrf=session['csrf'],money=lambda n:f'{n:,}'.replace(',','.')+'đ',states=STATES)
@@ -57,6 +60,66 @@ def auth():
                 if u and check_password_hash(u['password'],pw): session.clear(); session['uid']=u['id']; return redirect('/admin' if u['role']=='admin' else '/orders')
                 error='Thông tin đăng nhập không đúng.'
     return page('<div class="panel" style="max-width:460px;margin:32px auto"><div style="text-align:center;margin-bottom:8px"><img src="/logo" alt="PT Agency" style="width:72px;height:72px;object-fit:cover;border-radius:50%"></div><h2 style="text-align:center">{{"Đăng ký" if reg else "Đăng nhập"}}</h2><p style="text-align:center">{{"Tạo tài khoản để đặt dịch vụ Tick Xanh Fanpage." if reg else "Đăng nhập để quản lý đơn hàng của bạn."}}</p>{% if error %}<div class="error">{{error}}</div>{% endif %}<form method="post">'+F+'{% if reg %}<label>Họ tên</label><input name="name" required>{% endif %}<label>Email</label><input type="email" name="email" required><label>Mật khẩu</label><input type="password" name="password" required><p><small>Mật khẩu ít nhất 12 ký tự.</small></p><button style="width:100%">Tiếp tục</button></form><p style="text-align:center;margin-top:16px">{% if reg %}Đã có tài khoản? <a href="/login">Đăng nhập</a>{% else %}Chưa có tài khoản? <a href="/register">Đăng ký</a>{% endif %}</p><p style="text-align:center"><small>Cần hỗ trợ? Zalo 0819 869 828</small></p></div>',reg=reg,error=error)
+
+@app.route('/webhook/sepay',methods=['POST'])
+@app.route('/api/payments/webhook/sepay',methods=['POST'])
+def sepay_webhook():
+    key=os.environ.get('SEPAY_API_KEY','')
+    if key:
+        auth=request.headers.get('Authorization','') or request.headers.get('X-Secret-Key','')
+        if auth not in ('Apikey '+key,'Bearer '+key,key):
+            return jsonify({'success':False,'error':'unauthorized'}),401
+    data=request.get_json(silent=True)
+    if not isinstance(data,dict):
+        if request.form: data=dict(request.form)
+        else: return jsonify({'success':False,'error':'bad body'}),400
+    def pick(*names):
+        for n in names:
+            v=data.get(n)
+            if v is not None and v!='': return v
+        return None
+    sid=pick('transaction_id','id')
+    gateway=pick('gateway','')
+    acct=str(pick('account_number','accountNumber','') or '')
+    content=str(pick('content','') or '')
+    ttype=str(pick('transfer_type','transferType','') or '').lower()
+    raw_amt=pick('amount','transferAmount')
+    try: amount=int(raw_amt) if raw_amt is not None else None
+    except (ValueError,TypeError): amount=None
+    if ttype in ('out','debit','withdraw'):
+        return jsonify({'success':True}),200
+    if acct and acct!=SEPAY_ACCOUNT:
+        return jsonify({'success':True}),200
+    m=re.search(r'PT[A-F0-9]{12}',content.upper()) or re.search(r'PT-[A-F0-9]{12}',content.upper())
+    if not m:
+        with db() as c: c.execute('INSERT INTO logs(actor,action) VALUES(?,?)',('sepay','webhook no order code: '+content[:120]))
+        return jsonify({'success':True}),200
+    code=m.group(0)
+    candidates=[code]
+    if '-' not in code: candidates.append('PT-'+code[2:])
+    else: candidates.append(code.replace('-',''))
+    txn_key=str(sid) if sid not in (None,'') else (content+'|'+str(amount)+'|'+str(pick('transaction_date','transactionDate','')))
+    with db() as c:
+        if c.execute('SELECT 1 FROM sepay_txns WHERE sepay_id=?',(txn_key,)).fetchone():
+            return jsonify({'success':True}),200
+        o=None
+        for cand in candidates:
+            o=c.execute('SELECT * FROM orders WHERE id=?',(cand,)).fetchone()
+            if o: break
+        if not o:
+            c.execute('INSERT INTO logs(actor,action) VALUES(?,?)',('sepay','webhook order not found: '+code))
+            return jsonify({'success':True}),200
+        expected=o['qty']*o['price']
+        if amount is not None and amount!=expected:
+            c.execute('INSERT INTO logs(actor,action) VALUES(?,?)',('sepay',f'webhook amount mismatch {o["id"]} got {amount} expected {expected}'))
+            return jsonify({'success':True}),200
+        c.execute('INSERT OR IGNORE INTO sepay_txns(sepay_id,oid,amount,content) VALUES(?,?,?,?)',(txn_key,o['id'],amount,content))
+        if o['status'] in (STATES[0],STATES[1]):
+            c.execute('UPDATE orders SET status=? WHERE id=?',(STATES[2],o['id']))
+            c.execute('INSERT INTO logs(actor,action) VALUES(?,?)',('sepay','auto paid '+o['id']+' via '+(str(gateway) or 'sepay')))
+        else:
+            c.execute('INSERT INTO logs(actor,action) VALUES(?,?)',('sepay','webhook duplicate/late '+o['id']+' status '+o['status']))
+    return jsonify({'success':True}),200
 @app.post('/logout')
 def logout(): session.clear(); return redirect('/')
 @app.route('/orders',methods=['GET','POST'])
@@ -70,9 +133,9 @@ def orders():
             except (ValueError,KeyError,AssertionError): abort(400)
             name=request.form.get('page','').strip()
             if not name or len(name)>250: abort(400)
-            c.execute('INSERT INTO orders(id,uid,page,qty,price,cost,commission,status) VALUES(?,?,?,?,?,?,?,?)',('PT-'+uuid.uuid4().hex[:12].upper(),u['id'],name,qty,s['price'],s['cost'],s['commission'],STATES[0])); return redirect('/orders')
+            c.execute('INSERT INTO orders(id,uid,page,qty,price,cost,commission,status) VALUES(?,?,?,?,?,?,?,?)',('PT'+uuid.uuid4().hex[:12].upper(),u['id'],name,qty,s['price'],s['cost'],s['commission'],STATES[0])); return redirect('/orders')
         rows=c.execute('SELECT * FROM orders WHERE uid=? ORDER BY created DESC',(u['id'],)).fetchall()
-    return page('<h2>Đơn hàng của tôi</h2><p>Đặt Fanpage mới và theo dõi tiến độ từng đơn. Giá hiện tại: <b style="color:#2563eb">{{money(s.price)}} / Page</b>.</p><div class="panel"><h3>Đặt Fanpage mới</h3><form method="post">'+F+'<label>Tên Fanpage</label><input name="page" required maxlength="250" placeholder="Nhập tên Fanpage cần khởi tạo"><label>Số lượng</label><input type="number" min="1" max="100" value="1" name="qty" id="qty" oninput="document.getElementById(\'sum\').textContent=(this.value*{{s.price}}).toLocaleString(\'vi-VN\')+\'đ\'" required><p>Tổng tiền: <b id="sum" style="color:#2563eb">{{money(s.price)}}</b></p><button>Tạo đơn</button></form><p class="note" style="margin-top:16px"><b>Thanh toán chuyển khoản — VietinBank</b><br>STK: <b>102816811239</b> · Chủ TK: PHAN NGOC THACH · Ngân hàng: VietinBank<br>Nội dung chuyển khoản: mã đơn (ví dụ PT-...). Sau khi tạo đơn, quét mã VietQR trong đơn để chuyển khoản đúng số tiền và nội dung. Chưa tích hợp ngân hàng tự động — PT Agency xác nhận thủ công sau khi đối soát. Liên hệ Zalo 0819 869 828.</p></div>{% for o in rows %}<div class="panel"><div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center"><b>{{o.id}}</b><span class="badge {% if o.status==\'Hoàn thành\' %}badge-done{% elif o.status==\'Đã hủy\' %}badge-cancel{% elif o.status in [\'Chờ thanh toán\',\'Chờ xác nhận\'] %}badge-wait{% else %}badge-proc{% endif %}">{{o.status}}</span></div><h3 style="margin-top:12px">{{o.page}}</h3><p>{{money(o.qty*o.price)}} · {{o.qty}} Page · <small>{{o.created}}</small></p>{% if o.status==states[0] %}<div class="note" style="margin:12px 0"><h3 style="margin-bottom:8px">Thanh toán chuyển khoản — VietQR</h3><div class="paygrid"><img class="qr" src="https://img.vietqr.io/image/vietinbank-102816811239-compact2.png?amount={{o.qty*o.price}}&addInfo={{o.id}}&accountName=PHAN%20NGOC%20THACH" alt="Mã VietQR thanh toán đơn {{o.id}}"><div><p><b>Ngân hàng:</b> VietinBank<br><b>STK:</b> 102816811239<br><b>Chủ TK:</b> PHAN NGOC THACH<br><b>Số tiền:</b> {{money(o.qty*o.price)}}<br><b>Nội dung chuyển khoản:</b> {{o.id}}</p><p>Quét mã bằng app ngân hàng bất kỳ, kiểm tra đúng số tiền và đúng nội dung là mã đơn trên, rồi bấm “Thông báo đã chuyển khoản” bên dưới.</p></div></div></div><form method="post" action="/notify/{{o.id}}">'+F+'<button class="btn-ghost">Thông báo đã chuyển khoản</button></form>{% endif %}{% if o.link %}<p>Link bàn giao: <a href="{{o.link}}">{{o.link}}</a></p>{% endif %}</div>{% else %}<div class="panel"><p>Bạn chưa có đơn hàng nào. Đặt đơn đầu tiên ở form phía trên.</p></div>{% endfor %}',rows=rows,s=s)
+    return page('<h2>Đơn hàng của tôi</h2><p>Đặt Fanpage mới và theo dõi tiến độ từng đơn. Giá hiện tại: <b style="color:#2563eb">{{money(s.price)}} / Page</b>.</p><div class="panel"><h3>Đặt Fanpage mới</h3><form method="post">'+F+'<label>Tên Fanpage</label><input name="page" required maxlength="250" placeholder="Nhập tên Fanpage cần khởi tạo"><label>Số lượng</label><input type="number" min="1" max="100" value="1" name="qty" id="qty" oninput="document.getElementById(\'sum\').textContent=(this.value*{{s.price}}).toLocaleString(\'vi-VN\')+\'đ\'" required><p>Tổng tiền: <b id="sum" style="color:#2563eb">{{money(s.price)}}</b></p><button>Tạo đơn</button></form><p class="note" style="margin-top:16px"><b>Thanh toán chuyển khoản — VietinBank</b><br>STK: <b>102816811239</b> · Chủ TK: PHAN NGOC THACH · Ngân hàng: VietinBank<br>Nội dung chuyển khoản: SEVQR + mã đơn, ví dụ SEVQR PTFDF50779808D (mã đơn là 1 dòng cụ thể, không chứa dấu -). Giữ đúng nội dung này để SePay nhận được biến động số dư VietinBank. Sau khi tạo đơn, quét mã VietQR trong đơn để chuyển khoản đúng số tiền và nội dung. SePay đối soát tự động khi tiền về; nếu chưa nối SePay, PT Agency xác nhận thủ công sau khi đối soát. Liên hệ Zalo 0819 869 828.</p></div>{% for o in rows %}<div class="panel"><div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center"><b>{{o.id}}</b><span class="badge {% if o.status==\'Hoàn thành\' %}badge-done{% elif o.status==\'Đã hủy\' %}badge-cancel{% elif o.status in [\'Chờ thanh toán\',\'Chờ xác nhận\'] %}badge-wait{% else %}badge-proc{% endif %}">{{o.status}}</span></div><h3 style="margin-top:12px">{{o.page}}</h3><p>{{money(o.qty*o.price)}} · {{o.qty}} Page · <small>{{o.created}}</small></p>{% if o.status==states[0] %}<div class="note" style="margin:12px 0"><h3 style="margin-bottom:8px">Thanh toán chuyển khoản — VietQR</h3><div class="paygrid"><img class="qr" src="https://img.vietqr.io/image/vietinbank-102816811239-compact2.png?amount={{o.qty*o.price}}&addInfo=SEVQR%20{{o.id}}&accountName=PHAN%20NGOC%20THACH" alt="Mã VietQR thanh toán đơn {{o.id}}"><div><p><b>Ngân hàng:</b> VietinBank<br><b>STK:</b> 102816811239<br><b>Chủ TK:</b> PHAN NGOC THACH<br><b>Số tiền:</b> {{money(o.qty*o.price)}}<br><b>Nội dung chuyển khoản:</b> SEVQR {{o.id}}</p><p><small>Mã đơn là 1 dòng cụ thể, không chứa dấu -. Giữ đúng nội dung SEVQR + mã đơn để SePay nhận được tiền về.</small></p><p>Quét mã bằng app ngân hàng bất kỳ, kiểm tra đúng số tiền và đúng nội dung là mã đơn trên, rồi bấm “Thông báo đã chuyển khoản” bên dưới.</p></div></div></div><form method="post" action="/notify/{{o.id}}">'+F+'<button class="btn-ghost">Thông báo đã chuyển khoản</button></form>{% endif %}{% if o.link %}<p>Link bàn giao: <a href="{{o.link}}">{{o.link}}</a></p>{% endif %}</div>{% else %}<div class="panel"><p>Bạn chưa có đơn hàng nào. Đặt đơn đầu tiên ở form phía trên.</p></div>{% endfor %}',rows=rows,s=s)
 @app.post('/notify/<oid>')
 @guard()
 def notify(oid):
@@ -99,5 +162,5 @@ def admin():
             c.execute('INSERT INTO logs(actor,action) VALUES(?,?)',(actor,action+' '+request.form.get('oid',''))); return redirect('/admin')
         rows=c.execute('SELECT orders.*,users.name,users.email FROM orders JOIN users ON users.id=orders.uid ORDER BY created DESC').fetchall(); customers=c.execute("SELECT name,email FROM users WHERE role='customer'").fetchall(); s=c.execute('SELECT * FROM settings').fetchone(); logs=c.execute('SELECT * FROM logs ORDER BY id DESC LIMIT 50').fetchall()
     paid=[o for o in rows if o['status'] in STATES[2:6]]; done=[o for o in rows if o['status']==STATES[5]]
-    return page('''<div class="shell"><aside class="panel" style="padding:16px"><h3 style="margin-bottom:12px">PT AGENCY · ADMIN</h3><a href="#overview">Tổng quan</a><a href="#list">Đơn hàng</a><a href="#customers">Khách hàng</a><a href="#settings">Giá &amp; chi phí</a><a href="#logs">Nhật ký</a><p style="margin-top:16px"><small>Liên hệ: Zalo 0819 869 828</small></p></aside><div><h2 id="overview">Bảng điều hành PT Agency</h2><p>Theo dõi đơn hàng, doanh thu và tiến độ bàn giao Tick Xanh Fanpage.</p><div class="grid">{% for k,v in metrics %}<div class="panel"><small>{{k}}</small><div class="metric">{{v}}</div></div>{% endfor %}</div><div class="panel" id="list"><h3>Quản lý đơn hàng</h3><p>Xác nhận thanh toán chỉ sau khi đối chiếu ngân hàng. Bản thử nghiệm không tự xác nhận giao dịch.</p><div class="scroll"><table><tr><th>Đơn / Khách hàng</th><th>Fanpage / Tiền</th><th>Trạng thái &amp; bàn giao</th></tr>{% for o in rows %}<tr><td><b>{{o.id}}</b><br>{{o.name}}<br><small>{{o.email}}</small></td><td>{{o.page}}<br><b>{{money(o.price*o.qty)}}</b></td><td><form method="post">'''+F+'''<input type="hidden" name="action" value="update"><input type="hidden" name="oid" value="{{o.id}}"><select name="status">{% for st in states %}<option {% if st==o.status %}selected{% endif %}>{{st}}</option>{% endfor %}</select><input name="link" placeholder="Link bàn giao" value="{{o.link}}"><button>Lưu</button></form>{% if o.finished %}<small>Bảo hành 12 tháng từ {{o.finished}}</small>{% endif %}</td></tr>{% endfor %}</table></div></div><div class="panel" id="customers"><h3>Khách hàng ({{customers|length}})</h3>{% for c in customers %}<p>{{c.name}} · {{c.email}}</p>{% else %}<p>Chưa có khách hàng nào đăng ký.</p>{% endfor %}</div><div class="panel" id="settings"><h3>Giá bán &amp; chi phí / Page</h3><form method="post">'''+F+'''<input type="hidden" name="action" value="settings"><div class="grid">{% for k,label in [('price','Giá bán'),('cost','Giá vốn'),('commission','Hoa hồng dự kiến')] %}<div><label>{{label}}</label><input name="{{k}}" type="number" min="0" value="{{s[k]}}" required></div>{% endfor %}</div><button>Lưu cấu hình</button></form><p>Giá vốn và hoa hồng mặc định 0, cần nhập thực tế. Chỉ áp dụng đơn mới.</p></div><div class="panel" id="logs"><h3>Nhật ký quản trị</h3>{% for l in logs %}<p>{{l.created}} · {{l.actor}} · {{l.action}}</p>{% else %}<p>Chưa có nhật ký.</p>{% endfor %}</div></div></div>''',rows=rows,customers=customers,s=s,logs=logs,metrics=[('Tổng đơn',len(rows)),('Tiền đã xác nhận',f"{sum(o['qty']*o['price'] for o in paid):,}đ"),('Hoàn thành',len(done)),('Lãi gộp dự kiến',f"{sum(o['qty']*(o['price']-o['cost']-o['commission']) for o in done):,}đ")])
+    return page('''<div class="shell"><aside class="panel" style="padding:16px"><h3 style="margin-bottom:12px">PT AGENCY · ADMIN</h3><a href="#overview">Tổng quan</a><a href="#list">Đơn hàng</a><a href="#customers">Khách hàng</a><a href="#settings">Giá &amp; chi phí</a><a href="#logs">Nhật ký</a><p style="margin-top:16px"><small>Liên hệ: Zalo 0819 869 828</small></p></aside><div><h2 id="overview">Bảng điều hành PT Agency</h2><p>Theo dõi đơn hàng, doanh thu và tiến độ bàn giao Tick Xanh Fanpage.</p><div class="grid">{% for k,v in metrics %}<div class="panel"><small>{{k}}</small><div class="metric">{{v}}</div></div>{% endfor %}</div><div class="panel" id="list"><h3>Quản lý đơn hàng</h3><p>{% if sepay_active %}Đối soát tự động qua SePay webhook: tiền về đúng số tiền và nội dung SEVQR + mã đơn thì đơn tự chuyển sang Đã thanh toán. Vẫn kiểm tra sao kê khi cần.{% else %}Xác nhận thanh toán chỉ sau khi đối chiếu ngân hàng. Chưa cấu hình SEPAY_API_KEY nên SePay chưa tự đối soát — bật đối soát tự động bằng cách đặt SEPAY_API_KEY trên Render và cấu hình webhook SePay.{% endif %}</p><div class="scroll"><table><tr><th>Đơn / Khách hàng</th><th>Fanpage / Tiền</th><th>Trạng thái &amp; bàn giao</th></tr>{% for o in rows %}<tr><td><b>{{o.id}}</b><br>{{o.name}}<br><small>{{o.email}}</small></td><td>{{o.page}}<br><b>{{money(o.price*o.qty)}}</b></td><td><form method="post">'''+F+'''<input type="hidden" name="action" value="update"><input type="hidden" name="oid" value="{{o.id}}"><select name="status">{% for st in states %}<option {% if st==o.status %}selected{% endif %}>{{st}}</option>{% endfor %}</select><input name="link" placeholder="Link bàn giao" value="{{o.link}}"><button>Lưu</button></form>{% if o.finished %}<small>Bảo hành 12 tháng từ {{o.finished}}</small>{% endif %}</td></tr>{% endfor %}</table></div></div><div class="panel" id="customers"><h3>Khách hàng ({{customers|length}})</h3>{% for c in customers %}<p>{{c.name}} · {{c.email}}</p>{% else %}<p>Chưa có khách hàng nào đăng ký.</p>{% endfor %}</div><div class="panel" id="settings"><h3>Giá bán &amp; chi phí / Page</h3><form method="post">'''+F+'''<input type="hidden" name="action" value="settings"><div class="grid">{% for k,label in [('price','Giá bán'),('cost','Giá vốn'),('commission','Hoa hồng dự kiến')] %}<div><label>{{label}}</label><input name="{{k}}" type="number" min="0" value="{{s[k]}}" required></div>{% endfor %}</div><button>Lưu cấu hình</button></form><p>Giá vốn và hoa hồng mặc định 0, cần nhập thực tế. Chỉ áp dụng đơn mới.</p></div><div class="panel" id="logs"><h3>Nhật ký quản trị</h3>{% for l in logs %}<p>{{l.created}} · {{l.actor}} · {{l.action}}</p>{% else %}<p>Chưa có nhật ký.</p>{% endfor %}</div></div></div>''',rows=rows,customers=customers,s=s,logs=logs,sepay_active=bool(os.environ.get('SEPAY_API_KEY')),metrics=[('Tổng đơn',len(rows)),('Tiền đã xác nhận',f"{sum(o['qty']*o['price'] for o in paid):,}đ"),('Hoàn thành',len(done)),('Lãi gộp dự kiến',f"{sum(o['qty']*(o['price']-o['cost']-o['commission']) for o in done):,}đ")])
 if __name__=='__main__': app.run(host='127.0.0.1',port=8000)
